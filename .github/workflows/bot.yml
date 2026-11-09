@@ -7,15 +7,15 @@ on:
 
 concurrency:
   group: referral-bot
-  cancel-in-progress: false
+  cancel-in-progress: true # <--- ТЕПЕРЬ СТАРЫЙ ЗАПУСК УБИВАЕТСЯ ПРИНУДИТЕЛЬНО
 
 permissions:
-  contents: write          # Важно: право на запись для сохранения базы
+  contents: write
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 355   # Меньше 6 часов
+    timeout-minutes: 355
 
     steps:
       - name: Checkout repository
@@ -39,7 +39,7 @@ jobs:
         run: python bot.py
 
       - name: Commit updated data
-        if: always()
+        if: always() # Важно! Сохранит базу даже если бота только что убили
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
