@@ -78,7 +78,8 @@ async def save_user_if_new(user_id: int, referrer_id: int | None = None, usernam
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
         if await cursor.fetchone():
-            await db.execute("UPDATE users SET username = ?, first_name = ? WHERE user_id = ?", (username, first_name, user_id))
+            # Обновляем данные, если пользователь уже есть (на случай, если сменил имя)
+            await db.execute("UPDATE users SET username = COALESCE(?, username), first_name = COALESCE(?, first_name) WHERE user_id = ?", (username, first_name, user_id))
             await db.commit()
             return False
         
@@ -260,21 +261,21 @@ async def cmd_users(message: Message):
     for row in rows:
         user_id, username, first_name, nft_username, ref_count = row
         
-        # Безопасно экранируем имя (чтобы символы < > не ломали HTML)
-        safe_name = html.escape(first_name) if first_name else "Без имени"
+        # Безопасно экранируем имя
+        safe_name = html.escape(first_name) if first_name else None
         
-        # Формируем визуальное отображение
+        # Формируем кликабельную ссылку на профиль
         if username:
-            display_name = f"{safe_name} (@{username})"
-        else:
+            display_name = f"{safe_name} (@{username})" if safe_name else f"@{username}"
+        elif safe_name:
             display_name = safe_name
+        else:
+            display_name = f"ID {user_id}"
             
-        # Делаем имя кликабельным через tg://user?id=
         user_link = f'<a href="tg://user?id={user_id}">{display_name}</a>'
         
         nft_str = f"@{nft_username}" if nft_username else "—"
         
-        # Формируем строку (используем HTML разметку для ссылки и жирного текста)
         text += f"{user_link} | NFT: {nft_str} | <b>{ref_count}</b> реф.\n"
         
         if len(text) > 3500:
