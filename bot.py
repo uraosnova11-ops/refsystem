@@ -9,7 +9,7 @@ from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, ChatMemberUpdated
+from aiogram.types import Message, ChatMemberUpdated, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, User
 
 # ─── Конфигурация ────────────────────────────────────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -114,18 +114,20 @@ def load_offset() -> int | None:
 def save_offset(offset: int):
     OFFSET_PATH.write_text(str(offset))
 
-# ─── Роутер ──────────────────────────────────────────────────────────────────
+# ─── Роутер и Клавиатура ─────────────────────────────────────────────────────
 router = Router()
+
+def get_ref_keyboard() -> InlineKeyboardMarkup:
+    """Создает кнопку для генерации ссылки."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔗 Создать реф ссылку", callback_data="create_ref_link")]
+    ])
 
 async def _generate_group_invite(bot: Bot, user: User) -> str:
     if not GROUP_ID:
         return "Ошибка: GROUP_ID не настроен в секретах."
     
-    # Получаем имя для ссылки: username, если есть, иначе имя, иначе ID
     display_name = user.username or user.first_name or str(user.id)
-    
-    # Очищаем имя от лишних символов (Telegram не любит некоторые спецсимволы в названиях ссылок)
-    # Оставляем только буквы, цифры, пробелы, дефисы и подчеркивания. Максимум 32 символа.
     safe_name = "".join(c for c in display_name if c.isalnum() or c in " _-")[:32].strip()
     if not safe_name:
         safe_name = f"user_{user.id}"
@@ -133,7 +135,7 @@ async def _generate_group_invite(bot: Bot, user: User) -> str:
     try:
         link_obj = await bot.create_chat_invite_link(
             chat_id=GROUP_ID,
-            name=safe_name,  # <- Теперь здесь имя пользователя!
+            name=safe_name,
             creates_join_request=False
         )
         await save_invite_link(link_obj.invite_link, user.id)
@@ -142,28 +144,44 @@ async def _generate_group_invite(bot: Bot, user: User) -> str:
         logger.error(f"Ошибка создания ссылки: {e}")
         return "Не удалось создать ссылку. Убедитесь, что бот админ в группе."
 
+# ─── Обработчики команд ──────────────────────────────────────────────────────
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, bot: Bot):
-    user = message.from_user
-    await save_user_if_new(user.id)
-    
-    link = await _generate_group_invite(bot, user)
+    user_id = message.from_user.id
+    await save_user_if_new(user_id)
     
     text = (
-        f"👋 Привет! Твоя персональная ссылка для вступления в группу:\n\n"
-        f"`{link}`\n\n"
-        f"📊 /stats — количество рефералов\n"
-        f"🔗 /link — получить ссылку повторно\n\n"
-        f"⚠️ **Важно:** не выходи из группы, иначе реферал не засчитается."
+        f"👋 Привет! Я бот для создания реферальных ссылок в нашу группу.\n\n"
+        f"Нажми на кнопку ниже, чтобы получить свою личную ссылку.\n\n"
+        f"📊 /stats — количество приглашенных рефералов"
     )
-    await message.answer(text, parse_mode=ParseMode.MARKDOWN)
+    await message.answer(text, reply_markup=get_ref_keyboard())
 
 @router.message(Command("link"))
 async def cmd_link(message: Message, bot: Bot):
-    user = message.from_user
+    await save_user_if_new(message.from_user.id)
+    await message.answer("Нажми на кнопку, чтобы создать свою реферальную ссылку:", reply_markup=get_ref_keyboard())
+
+@router.callback_query(F.data == "create_ref_link")
+async def process_create_link(callback: CallbackQuery, bot: Bot):
+    # Подтверждаем получение колбэка (чтобы часики на кнопке перестали крутиться)
+    await callback.answer("Создаю ссылку...")
+    
+    user = callback.from_user
     await save_user_if_new(user.id)
+    
+    # Генерируем ссылку
     link = await _generate_group_invite(bot, user)
-    await message.answer(f"🔗 Твоя ссылка для входа в группу:\n\n`{link}`", parse_mode=ParseMode.MARKDOWN)
+    
+    text = (
+        f"✅ Твоя персональная ссылка для вступления в группу:\n\n"
+        f"`{link}`\n\n"
+        f"⚠️ **Важно:** не выходи из группы, иначе реферал не засчитается."
+    )
+    
+    # Отправляем в ЛС пользователю (reply на сообщение с кнопкой)
+    await callback.message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
 @router.message(Command("stats", "myrefs"))
 async def cmd_stats(message: Message, bot: Bot):
@@ -183,6 +201,8 @@ async def cmd_stats(message: Message, bot: Bot):
             await set_user_state(user_id, "waiting_for_username")
             
     await message.answer(text, parse_mode=ParseMode.MARKDOWN)
+
+# ─── Отслеживание вступлений ─────────────────────────────────────────────────
 
 @router.chat_member()
 async def on_chat_member(event: ChatMemberUpdated, bot: Bot):
@@ -205,6 +225,7 @@ async def on_chat_member(event: ChatMemberUpdated, bot: Bot):
             if created:
                 try:
                     count = await get_referral_count(referrer_id)
+                    # Отправляем уведомление только в ЛС пригласившему
                     await bot.send_message(
                         referrer_id,
                         f"👤 По вашей ссылке в группу пришёл новый пользователь!\n"
@@ -212,6 +233,8 @@ async def on_chat_member(event: ChatMemberUpdated, bot: Bot):
                     )
                 except Exception:
                     pass 
+
+# ─── Ввод юзернейма (когда 10 рефов) ─────────────────────────────────────────
 
 @router.message(F.text, ~F.text.startswith("/"))
 async def handle_nft_username(message: Message, bot: Bot):
@@ -247,7 +270,7 @@ async def run_polling(bot: Bot, dp: Dispatcher, limit_seconds: int):
 
     while datetime.now() < end_time:
         try:
-            updates = await bot.get_updates(offset=offset, timeout=30, allowed_updates=["message", "chat_member"])
+            updates = await bot.get_updates(offset=offset, timeout=30, allowed_updates=["message", "chat_member", "callback_query"])
             if not updates:
                 await asyncio.sleep(2)
                 continue
