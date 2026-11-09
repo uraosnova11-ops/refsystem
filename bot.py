@@ -54,6 +54,18 @@ async def init_db():
                 referrer_id  INTEGER
             );
         """)
+        
+        # Безопасно добавляем новые колонки для юзернейма и имени (если их еще нет)
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN username TEXT")
+        except aiosqlite.OperationalError:
+            pass # Колонка уже существует
+            
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN first_name TEXT")
+        except aiosqlite.OperationalError:
+            pass # Колонка уже существует
+            
         await db.commit()
 
 async def get_referral_count(user_id: int) -> int:
@@ -62,12 +74,21 @@ async def get_referral_count(user_id: int) -> int:
         row = await cursor.fetchone()
         return row[0] if row else 0
 
-async def save_user_if_new(user_id: int, referrer_id: int | None = None) -> bool:
+# ОБНОВЛЕННАЯ ФУНКЦИЯ СОХРАНЕНИЯ (теперь пишет имя и юзернейм)
+async def save_user_if_new(user_id: int, referrer_id: int | None = None, username: str | None = None, first_name: str | None = None) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
         if await cursor.fetchone():
+            # Если юзер уже есть, обновляем его имя/юзернейм (вдруг сменил)
+            await db.execute("UPDATE users SET username = ?, first_name = ? WHERE user_id = ?", (username, first_name, user_id))
+            await db.commit()
             return False
-        await db.execute("INSERT INTO users (user_id, referrer_id) VALUES (?, ?)", (user_id, referrer_id))
+        
+        # Если новый — записываем
+        await db.execute(
+            "INSERT INTO users (user_id, referrer_id, username, first_name) VALUES (?, ?, ?, ?)", 
+            (user_id, referrer_id, username, first_name)
+        )
         await db.commit()
         return True
 
@@ -172,7 +193,7 @@ async def _generate_group_invite(bot: Bot, user: User) -> tuple[bool, str]:
 @router.message(CommandStart(), F.chat.type == "private")
 async def cmd_start(message: Message, bot: Bot):
     user = message.from_user
-    await save_user_if_new(user.id)
+    await save_user_if_new(user.id, username=user.username, first_name=user.first_name)
     
     success, result_text = await _generate_group_invite(bot, user)
     
@@ -191,7 +212,7 @@ async def cmd_start(message: Message, bot: Bot):
 @router.message(Command("link"), F.chat.type == "private")
 async def cmd_link(message: Message, bot: Bot):
     user = message.from_user
-    await save_user_if_new(user.id)
+    await save_user_if_new(user.id, username=user.username, first_name=user.first_name)
     
     success, result_text = await _generate_group_invite(bot, user)
     
@@ -202,17 +223,17 @@ async def cmd_link(message: Message, bot: Bot):
 
 @router.message(Command("stats", "myrefs"), F.chat.type == "private")
 async def cmd_stats(message: Message, bot: Bot):
-    user_id = message.from_user.id
-    await save_user_if_new(user_id)
-    ref_count = await get_referral_count(user_id)
+    user = message.from_user
+    await save_user_if_new(user.id, username=user.username, first_name=user.first_name)
+    ref_count = await get_referral_count(user.id)
     
     text = f"📊 Ты пригласил: **{ref_count}** реферал(ов).\n"
     
     if ref_count >= 10:
-        nft_username = await get_user_nft_username(user_id)
+        nft_username = await get_user_nft_username(user.id)
         if not nft_username:
             text += "\n⚠️ Укажи юзернейм (без @), куда будут приходить NFT:"
-            await set_user_state(user_id, "waiting_for_username")
+            await set_user_state(user.id, "waiting_for_username")
             
     await message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
@@ -220,15 +241,14 @@ async def cmd_stats(message: Message, bot: Bot):
 
 @router.message(Command("users"), F.chat.type == "private")
 async def cmd_users(message: Message):
-    # Проверяем, что команду пишет именно владелец (ADMIN_ID из секретов)
     if str(message.from_user.id) != str(ADMIN_ID):
         await message.answer("❌ У вас нет прав для этой команды.")
         return
 
     async with aiosqlite.connect(DB_PATH) as db:
-        # Получаем всех юзеров и считаем их рефералов
+        # Получаем ID, юзернейм, имя и считаем рефералов
         cursor = await db.execute("""
-            SELECT u1.user_id, u1.nft_username, COUNT(u2.user_id) as ref_count
+            SELECT u1.user_id, u1.username, u1.first_name, u1.nft_username, COUNT(u2.user_id) as ref_count
             FROM users u1
             LEFT JOIN users u2 ON u1.user_id = u2.referrer_id
             GROUP BY u1.user_id
@@ -240,21 +260,28 @@ async def cmd_users(message: Message):
         await message.answer("В базе пока нет пользователей.")
         return
 
-    text = "👥 **Список пользователей (ID | NFT | Рефералы):**\n\n"
+    text = "👥 **Список пользователей:**\n\n"
     for row in rows:
-        user_id, nft_username, ref_count = row
+        user_id, username, first_name, nft_username, ref_count = row
+        
+        # Форматируем имя
+        if username:
+            user_str = f"@{username}"
+        elif first_name:
+            user_str = first_name
+        else:
+            user_str = "Без имени"
+            
         nft_str = f"@{nft_username}" if nft_username else "—"
         
-        # Формируем строку: ID | NFT | Кол-во рефов
-        text += f"`{user_id}` | {nft_str} | **{ref_count}**\n"
+        # Формируем строку
+        text += f"`{user_id}` | {user_str} | NFT: {nft_str} | **{ref_count}** реф.\n"
         
-        # Если текст становится слишком длинным (близко к лимиту 4096), отправляем и начинаем новый
         if len(text) > 3500:
             await message.answer(text, parse_mode=ParseMode.MARKDOWN)
             text = "👥 **Продолжение списка:**\n\n"
 
-    # Отправляем остаток, если он есть
-    if text not in ("👥 **Список пользователей (ID | NFT | Рефералы):**\n\n", "👥 **Продолжение списка:**\n\n"):
+    if text not in ("👥 **Список пользователей:**\n\n", "👥 **Продолжение списка:**\n\n"):
         await message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
 # ─── Отслеживание вступлений ─────────────────────────────────────────────────
@@ -268,7 +295,8 @@ async def on_chat_member(event: ChatMemberUpdated, bot: Bot):
     new_status = event.new_chat_member.status
     
     if old_status in ("left", "kicked") and new_status in ("member", "administrator", "creator"):
-        new_user_id = event.new_chat_member.user.id
+        new_user = event.new_chat_member.user
+        new_user_id = new_user.id
         
         invite_link = event.invite_link.invite_link if event.invite_link else None
         if not invite_link:
@@ -276,7 +304,13 @@ async def on_chat_member(event: ChatMemberUpdated, bot: Bot):
 
         referrer_id = await get_referrer_by_link(invite_link)
         if referrer_id and referrer_id != new_user_id:
-            created = await save_user_if_new(new_user_id, referrer_id)
+            # Сохраняем нового пользователя, пришедшего по ссылке
+            created = await save_user_if_new(
+                new_user_id, 
+                referrer_id=referrer_id, 
+                username=new_user.username, 
+                first_name=new_user.first_name
+            )
             if created:
                 try:
                     count = await get_referral_count(referrer_id)
