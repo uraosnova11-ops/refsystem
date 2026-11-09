@@ -1,0 +1,56 @@
+name: Referral Bot
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"  # Запуск каждые 6 часов
+  workflow_dispatch:       # Ручной запуск
+
+concurrency:
+  group: referral-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: write          # Важно: право на запись для сохранения базы
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355   # Меньше 6 часов
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
+        run: python bot.py
+
+      - name: Commit updated data
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          if git diff --cached --quiet; then
+            echo "No changes"
+          else
+            git commit -m "chore: update bot state [skip ci]"
+            for i in 1 2 3 4 5; do
+              git push && break
+              git fetch origin main
+              git rebase origin/main || { git rebase --abort; exit 1; }
+              sleep 3
+            done
+          fi
