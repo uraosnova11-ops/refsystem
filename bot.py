@@ -56,6 +56,7 @@ async def init_db():
             );
         """)
         
+        # Добавляем недостающие колонки безопасно
         try:
             await db.execute("ALTER TABLE users ADD COLUMN username TEXT")
         except aiosqlite.OperationalError:
@@ -63,6 +64,12 @@ async def init_db():
             
         try:
             await db.execute("ALTER TABLE users ADD COLUMN first_name TEXT")
+        except aiosqlite.OperationalError:
+            pass 
+
+        # НОВАЯ КОЛОНКА: сохраняем ссылку прямо в юзера
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN invite_link TEXT")
         except aiosqlite.OperationalError:
             pass 
             
@@ -78,7 +85,6 @@ async def save_user_if_new(user_id: int, referrer_id: int | None = None, usernam
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
         if await cursor.fetchone():
-            # Обновляем данные, если пользователь уже есть (на случай, если сменил имя)
             await db.execute("UPDATE users SET username = COALESCE(?, username), first_name = COALESCE(?, first_name) WHERE user_id = ?", (username, first_name, user_id))
             await db.commit()
             return False
@@ -90,20 +96,16 @@ async def save_user_if_new(user_id: int, referrer_id: int | None = None, usernam
         await db.commit()
         return True
 
-async def save_invite_link(link: str, referrer_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT OR REPLACE INTO invite_links (invite_link, referrer_id) VALUES (?, ?)", (link, referrer_id))
-        await db.commit()
-
 async def get_referrer_by_link(link: str) -> int | None:
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT referrer_id FROM invite_links WHERE invite_link = ?", (link,))
+        # Ищем в новой колонке users
+        cursor = await db.execute("SELECT user_id FROM users WHERE invite_link = ?", (link,))
         row = await cursor.fetchone()
-        return row[0] if row else None
-
-async def get_existing_link(referrer_id: int) -> str | None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT invite_link FROM invite_links WHERE referrer_id = ? LIMIT 1", (referrer_id,))
+        if row:
+            return row[0]
+        
+        # Фоллбэк на старую таблицу invite_links
+        cursor = await db.execute("SELECT referrer_id FROM invite_links WHERE invite_link = ?", (link,))
         row = await cursor.fetchone()
         return row[0] if row else None
 
@@ -148,10 +150,14 @@ async def _generate_group_invite(bot: Bot, user: User) -> tuple[bool, str]:
     if not GROUP_ID:
         return False, "Ошибка сервера: GROUP_ID не настроен в секретах."
 
-    existing_link = await get_existing_link(user.id)
-    if existing_link:
-        return True, existing_link
+    # 1. Ищем ссылку в профиле юзера
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT invite_link FROM users WHERE user_id = ?", (user.id,))
+        row = await cursor.fetchone()
+        if row and row[0]:
+            return True, row[0] # Если ссылка есть, отдаем её НАВСЕГДА
 
+    # 2. Если нет, генерируем новую
     display_name = user.username or user.first_name or str(user.id)
     safe_name = "".join(c for c in display_name if c.isalnum() or c in " _-")[:32].strip()
     if not safe_name:
@@ -166,8 +172,16 @@ async def _generate_group_invite(bot: Bot, user: User) -> tuple[bool, str]:
             ),
             timeout=10.0
         )
-        await save_invite_link(link_obj.invite_link, user.id)
-        return True, link_obj.invite_link
+        new_link = link_obj.invite_link
+
+        # 3. Жестко сохраняем ссылку в профиль, чтобы больше никогда её не менять
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET invite_link = ? WHERE user_id = ?", (new_link, user.id))
+            # Дублируем в старую таблицу для обратной совместимости
+            await db.execute("INSERT OR REPLACE INTO invite_links (invite_link, referrer_id) VALUES (?, ?)", (new_link, user.id))
+            await db.commit()
+
+        return True, new_link
 
     except asyncio.TimeoutError:
         logger.error("Timeout creating invite link for user %s", user.id)
@@ -261,10 +275,8 @@ async def cmd_users(message: Message):
     for row in rows:
         user_id, username, first_name, nft_username, ref_count = row
         
-        # Безопасно экранируем имя
         safe_name = html.escape(first_name) if first_name else None
         
-        # Формируем кликабельную ссылку на профиль
         if username:
             display_name = f"{safe_name} (@{username})" if safe_name else f"@{username}"
         elif safe_name:
