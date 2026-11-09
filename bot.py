@@ -129,12 +129,10 @@ async def _generate_group_invite(bot: Bot, user: User) -> tuple[bool, str]:
     if not GROUP_ID:
         return False, "Ошибка сервера: GROUP_ID не настроен в секретах."
 
-    # 1. Проверяем, есть ли уже ссылка в базе
     existing_link = await get_existing_link(user.id)
     if existing_link:
         return True, existing_link
 
-    # 2. Если нет, генерируем новую
     display_name = user.username or user.first_name or str(user.id)
     safe_name = "".join(c for c in display_name if c.isalnum() or c in " _-")[:32].strip()
     if not safe_name:
@@ -169,7 +167,6 @@ async def _generate_group_invite(bot: Bot, user: User) -> tuple[bool, str]:
         logger.exception("Unexpected error creating invite link")
         return False, "❌ Неизвестная ошибка при создании ссылки. Проверьте логи."
 
-
 # ─── Обработчики команд (ТОЛЬКО В ЛС) ────────────────────────────────────────
 
 @router.message(CommandStart(), F.chat.type == "private")
@@ -177,7 +174,6 @@ async def cmd_start(message: Message, bot: Bot):
     user = message.from_user
     await save_user_if_new(user.id)
     
-    # Сразу генерируем и отправляем ссылку
     success, result_text = await _generate_group_invite(bot, user)
     
     if success:
@@ -210,15 +206,13 @@ async def cmd_stats(message: Message, bot: Bot):
     await save_user_if_new(user_id)
     ref_count = await get_referral_count(user_id)
     
-    text = f"📊 Ты пригласил **{ref_count}** уникальных реферал(ов).\n"
+    # ОБНОВЛЕННЫЙ ТЕКСТ СТАТИСТИКИ
+    text = f"📊 Ты пригласил: **{ref_count}** реферал(ов).\n"
     
-    if ref_count < 10:
-        text += f"🎯 До 10 рефералов осталось: {10 - ref_count}"
-    else:
-        text += "✅ Порог в 10 рефералов достигнут!"
+    if ref_count >= 10:
         nft_username = await get_user_nft_username(user_id)
         if not nft_username:
-            text += "\n\n⚠️ Укажи юзернейм (без @), куда будут приходить NFT:"
+            text += "\n⚠️ Укажи юзернейм (без @), куда будут приходить NFT:"
             await set_user_state(user_id, "waiting_for_username")
             
     await message.answer(text, parse_mode=ParseMode.MARKDOWN)
@@ -291,7 +285,6 @@ async def run_polling(bot: Bot, dp: Dispatcher, limit_seconds: int, stop_event: 
 
     while datetime.now() < end_time and not stop_event.is_set():
         try:
-            # Убрал callback_query, так как кнопок больше нет
             updates = await bot.get_updates(offset=offset, timeout=30, allowed_updates=["message", "chat_member"])
             if not updates:
                 await asyncio.sleep(1)
