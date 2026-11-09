@@ -118,7 +118,6 @@ def save_offset(offset: int):
 router = Router()
 
 def get_ref_keyboard() -> InlineKeyboardMarkup:
-    """Создает кнопку для генерации ссылки."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔗 Создать реф ссылку", callback_data="create_ref_link")]
     ])
@@ -144,9 +143,9 @@ async def _generate_group_invite(bot: Bot, user: User) -> str:
         logger.error(f"Ошибка создания ссылки: {e}")
         return "Не удалось создать ссылку. Убедитесь, что бот админ в группе."
 
-# ─── Обработчики команд ──────────────────────────────────────────────────────
+# ─── Обработчики команд (СТРОГО ТОЛЬКО В ЛС) ─────────────────────────────────
 
-@router.message(CommandStart())
+@router.message(CommandStart(), F.chat.type == "private")
 async def cmd_start(message: Message, bot: Bot):
     user_id = message.from_user.id
     await save_user_if_new(user_id)
@@ -158,20 +157,17 @@ async def cmd_start(message: Message, bot: Bot):
     )
     await message.answer(text, reply_markup=get_ref_keyboard())
 
-@router.message(Command("link"))
+@router.message(Command("link"), F.chat.type == "private")
 async def cmd_link(message: Message, bot: Bot):
     await save_user_if_new(message.from_user.id)
     await message.answer("Нажми на кнопку, чтобы создать свою реферальную ссылку:", reply_markup=get_ref_keyboard())
 
-@router.callback_query(F.data == "create_ref_link")
+@router.callback_query(F.data == "create_ref_link", F.chat.type == "private")
 async def process_create_link(callback: CallbackQuery, bot: Bot):
-    # Подтверждаем получение колбэка (чтобы часики на кнопке перестали крутиться)
     await callback.answer("Создаю ссылку...")
-    
     user = callback.from_user
     await save_user_if_new(user.id)
     
-    # Генерируем ссылку
     link = await _generate_group_invite(bot, user)
     
     text = (
@@ -179,11 +175,9 @@ async def process_create_link(callback: CallbackQuery, bot: Bot):
         f"`{link}`\n\n"
         f"⚠️ **Важно:** не выходи из группы, иначе реферал не засчитается."
     )
-    
-    # Отправляем в ЛС пользователю (reply на сообщение с кнопкой)
     await callback.message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
-@router.message(Command("stats", "myrefs"))
+@router.message(Command("stats", "myrefs"), F.chat.type == "private")
 async def cmd_stats(message: Message, bot: Bot):
     user_id = message.from_user.id
     await save_user_if_new(user_id)
@@ -225,7 +219,7 @@ async def on_chat_member(event: ChatMemberUpdated, bot: Bot):
             if created:
                 try:
                     count = await get_referral_count(referrer_id)
-                    # Отправляем уведомление только в ЛС пригласившему
+                    # Уведомление летит строго в ЛС пригласившему
                     await bot.send_message(
                         referrer_id,
                         f"👤 По вашей ссылке в группу пришёл новый пользователь!\n"
@@ -234,14 +228,15 @@ async def on_chat_member(event: ChatMemberUpdated, bot: Bot):
                 except Exception:
                     pass 
 
-# ─── Ввод юзернейма (когда 10 рефов) ─────────────────────────────────────────
+# ─── Ввод юзернейма (СТРОГО В ЛС) ────────────────────────────────────────────
 
-@router.message(F.text, ~F.text.startswith("/"))
+@router.message(F.text, ~F.text.startswith("/"), F.chat.type == "private")
 async def handle_nft_username(message: Message, bot: Bot):
     user_id = message.from_user.id
     state = await get_user_state(user_id)
     
     if state != "waiting_for_username":
+        # Теперь этот текст полетит только в ЛС, в группу бот промолчит
         await message.answer("Используй /start или /link, чтобы получить ссылку.")
         return
 
