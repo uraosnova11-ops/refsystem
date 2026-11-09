@@ -11,7 +11,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, ChatMemberUpdated, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, User
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 
 # ─── Конфигурация ────────────────────────────────────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -82,7 +82,6 @@ async def get_referrer_by_link(link: str) -> int | None:
         row = await cursor.fetchone()
         return row[0] if row else None
 
-# НОВАЯ ФУНКЦИЯ: Получаем ссылку пользователя, если она уже есть в базе
 async def get_existing_link(referrer_id: int) -> str | None:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("SELECT invite_link FROM invite_links WHERE referrer_id = ? LIMIT 1", (referrer_id,))
@@ -131,24 +130,20 @@ def get_ref_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🔗 Создать реф ссылку", callback_data="create_ref_link")]
     ])
 
-# ОБНОВЛЕННАЯ ФУНКЦИЯ С ТАЙМ-АУТОМ И ОБРАБОТКОЙ ОШИБОК
 async def _generate_group_invite(bot: Bot, user: User) -> tuple[bool, str]:
     if not GROUP_ID:
         return False, "Ошибка сервера: GROUP_ID не настроен в секретах."
 
-    # 1. Проверяем, есть ли уже ссылка в базе
     existing_link = await get_existing_link(user.id)
     if existing_link:
         return True, existing_link
 
-    # 2. Если нет, генерируем новую
     display_name = user.username or user.first_name or str(user.id)
     safe_name = "".join(c for c in display_name if c.isalnum() or c in " _-")[:32].strip()
     if not safe_name:
         safe_name = f"user_{user.id}"
 
     try:
-        # Ждем ответ от Telegram не более 10 секунд, чтобы бот не завис навсегда
         link_obj = await asyncio.wait_for(
             bot.create_chat_invite_link(
                 chat_id=GROUP_ID,
@@ -199,13 +194,11 @@ async def cmd_link(message: Message, bot: Bot):
 
 @router.callback_query(F.data == "create_ref_link", F.chat.type == "private")
 async def process_create_link(callback: CallbackQuery, bot: Bot):
-    # Сразу убираем "часики" с кнопки
     await callback.answer("Обрабатываю...")
     
     user = callback.from_user
     await save_user_if_new(user.id)
     
-    # Генерируем ссылку (с проверкой на существование и тайм-аутом)
     success, result_text = await _generate_group_invite(bot, user)
     
     if success:
@@ -352,5 +345,6 @@ async def main():
         await bot.session.close()
         logger.info("Bot session closed. Safe to start new one.")
 
+# ВОТ ЗДЕСЬ БЫЛА ОШИБКА, ТЕПЕРЬ ИСПОЛЬЗУЕТСЯ asyncio.run()
 if __name__ == "__main__":
-    await main()
+    asyncio.run(main())
