@@ -10,14 +10,19 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, ChatMemberUpdated
-from aiogram.exceptions import TelegramBadRequest
 
 # ─── Конфигурация ────────────────────────────────────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_ID")
-GROUP_ID = int(os.getenv("GROUP_ID"))  # ID вашей группы
+GROUP_ID = os.getenv("GROUP_ID")
 
-POLLING_LIMIT_SECONDS = 5 * 60 * 60 + 50 * 60
+if GROUP_ID:
+    try:
+        GROUP_ID = int(GROUP_ID)
+    except ValueError:
+        raise RuntimeError("GROUP_ID must be an integer (e.g., -1001234567890)")
+
+POLLING_LIMIT_SECONDS = 5 * 60 * 60 + 50 * 60  # 5 часов 50 минут
 
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -113,8 +118,9 @@ def save_offset(offset: int):
 router = Router()
 
 async def _generate_group_invite(bot: Bot, user_id: int) -> str:
+    if not GROUP_ID:
+        return "Ошибка: GROUP_ID не настроен в секретах."
     try:
-        # Создаем новую ссылку (name позволяет отличать их в настройках группы)
         link_obj = await bot.create_chat_invite_link(
             chat_id=GROUP_ID,
             name=f"ref_{user_id}",
@@ -150,12 +156,13 @@ async def cmd_link(message: Message, bot: Bot):
     await message.answer(f"🔗 Твоя ссылка для входа в группу:\n\n`{link}`", parse_mode=ParseMode.MARKDOWN)
 
 @router.message(Command("stats", "myrefs"))
-async def cmd_stats(message: Message):
+async def cmd_stats(message: Message, bot: Bot):
     user_id = message.from_user.id
     await save_user_if_new(user_id)
     ref_count = await get_referral_count(user_id)
     
     text = f"📊 Ты пригласил **{ref_count}** уникальных реферал(ов).\n"
+    
     if ref_count < 10:
         text += f"🎯 До 10 рефералов осталось: {10 - ref_count}"
     else:
@@ -167,28 +174,23 @@ async def cmd_stats(message: Message):
             
     await message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
-# ─── Обработка вступления в группу ───────────────────────────────────────────
 @router.chat_member()
 async def on_chat_member(event: ChatMemberUpdated, bot: Bot):
-    # Реагируем только на нашу группу
     if event.chat.id != GROUP_ID:
         return
         
-    # Пользователь вступил (был left/kicked, стал member/administrator/creator)
     old_status = event.old_chat_member.status
     new_status = event.new_chat_member.status
     
     if old_status in ("left", "kicked") and new_status in ("member", "administrator", "creator"):
         new_user_id = event.new_chat_member.user.id
         
-        # Узнаем, по какой ссылке зашел
         invite_link = event.invite_link.invite_link if event.invite_link else None
         if not invite_link:
             return
 
         referrer_id = await get_referrer_by_link(invite_link)
         if referrer_id and referrer_id != new_user_id:
-            # Записываем реферал
             created = await save_user_if_new(new_user_id, referrer_id)
             if created:
                 try:
@@ -199,9 +201,8 @@ async def on_chat_member(event: ChatMemberUpdated, bot: Bot):
                         f"Теперь у вас {count} реферал(ов)."
                     )
                 except Exception:
-                    pass # Пользователь мог заблокировать бота
+                    pass 
 
-# ─── Ввод юзернейма (когда 10 рефов) ─────────────────────────────────────────
 @router.message(F.text, ~F.text.startswith("/"))
 async def handle_nft_username(message: Message, bot: Bot):
     user_id = message.from_user.id
@@ -236,7 +237,7 @@ async def run_polling(bot: Bot, dp: Dispatcher, limit_seconds: int):
 
     while datetime.now() < end_time:
         try:
-            # Важно: добавили "chat_member" в allowed_updates
+            # Обязательно добавлен "chat_member" для отслеживания вступлений
             updates = await bot.get_updates(offset=offset, timeout=30, allowed_updates=["message", "chat_member"])
             if not updates:
                 await asyncio.sleep(2)
