@@ -8,15 +8,15 @@ import aiosqlite
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart, Command, CommandObject
-from aiogram.types import Message
-from aiogram.utils.deep_linking import create_start_link
+from aiogram.filters import CommandStart, Command
+from aiogram.types import Message, ChatMemberUpdated
+from aiogram.exceptions import TelegramBadRequest
 
 # ─── Конфигурация ────────────────────────────────────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = os.getenv("ADMIN_ID")  # Сюда приходят уведомления
+ADMIN_ID = os.getenv("ADMIN_ID")
+GROUP_ID = int(os.getenv("GROUP_ID"))  # ID вашей группы
 
-# Ограничение времени работы (~5 ч 50 мин)
 POLLING_LIMIT_SECONDS = 5 * 60 * 60 + 50 * 60
 
 DATA_DIR = Path("data")
@@ -42,14 +42,16 @@ async def init_db():
                 state        TEXT,
                 first_seen   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS invite_links (
+                invite_link  TEXT PRIMARY KEY,
+                referrer_id  INTEGER
+            );
         """)
         await db.commit()
 
 async def get_referral_count(user_id: int) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT COUNT(*) FROM users WHERE referrer_id = ?", (user_id,)
-        )
+        cursor = await db.execute("SELECT COUNT(*) FROM users WHERE referrer_id = ?", (user_id,))
         row = await cursor.fetchone()
         return row[0] if row else 0
 
@@ -58,41 +60,40 @@ async def save_user_if_new(user_id: int, referrer_id: int | None = None) -> bool
         cursor = await db.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
         if await cursor.fetchone():
             return False
-        await db.execute(
-            "INSERT INTO users (user_id, referrer_id) VALUES (?, ?)",
-            (user_id, referrer_id),
-        )
+        await db.execute("INSERT INTO users (user_id, referrer_id) VALUES (?, ?)", (user_id, referrer_id))
         await db.commit()
         return True
 
+async def save_invite_link(link: str, referrer_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR REPLACE INTO invite_links (invite_link, referrer_id) VALUES (?, ?)", (link, referrer_id))
+        await db.commit()
+
+async def get_referrer_by_link(link: str) -> int | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT referrer_id FROM invite_links WHERE invite_link = ?", (link,))
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
 async def get_user_nft_username(user_id: int) -> str | None:
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT nft_username FROM users WHERE user_id = ?", (user_id,)
-        )
+        cursor = await db.execute("SELECT nft_username FROM users WHERE user_id = ?", (user_id,))
         row = await cursor.fetchone()
         return row[0] if row else None
 
 async def set_nft_username_and_state(user_id: int, username: str):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET nft_username = ?, state = NULL WHERE user_id = ?",
-            (username, user_id),
-        )
+        await db.execute("UPDATE users SET nft_username = ?, state = NULL WHERE user_id = ?", (username, user_id))
         await db.commit()
 
 async def set_user_state(user_id: int, state: str | None):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET state = ? WHERE user_id = ?", (state, user_id)
-        )
+        await db.execute("UPDATE users SET state = ? WHERE user_id = ?", (state, user_id))
         await db.commit()
 
 async def get_user_state(user_id: int) -> str | None:
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT state FROM users WHERE user_id = ?", (user_id,)
-        )
+        cursor = await db.execute("SELECT state FROM users WHERE user_id = ?", (user_id,))
         row = await cursor.fetchone()
         return row[0] if row else None
 
@@ -108,89 +109,45 @@ def load_offset() -> int | None:
 def save_offset(offset: int):
     OFFSET_PATH.write_text(str(offset))
 
-# ─── Роутер и обработчики ────────────────────────────────────────────────────
+# ─── Роутер ──────────────────────────────────────────────────────────────────
 router = Router()
 
-async def _generate_ref_link(bot: Bot, user_id: int) -> str:
-    return await create_start_link(bot, f"ref_{user_id}")
-
-async def _maybe_ask_for_nft(message: Message, user_id: int):
-    ref_count = await get_referral_count(user_id)
-    nft_username = await get_user_nft_username(user_id)
-
-    if ref_count >= 10 and not nft_username:
-        current_state = await get_user_state(user_id)
-        if current_state != "waiting_for_username":
-            await set_user_state(user_id, "waiting_for_username")
-            await message.answer(
-                "🎉 Поздравляем! Вы пригласили 10 рефералов.\n\n"
-                "Укажи юзернейм (без @), куда будут приходить NFT:"
-            )
-            return True
-    return False
-
-@router.message(CommandStart(deep_link=True))
-async def start_with_deep_link(message: Message, command: CommandObject, bot: Bot):
-    user_id = message.from_user.id
-    args = command.args
-
-    referrer_id = None
-    if args and args.startswith("ref_"):
-        try:
-            referrer_id = int(args.split("_", 1)[1])
-        except (ValueError, IndexError):
-            logger.warning("Invalid deep-link payload: %s", args)
-
-    if referrer_id == user_id:
-        referrer_id = None
-
-    created = await save_user_if_new(user_id, referrer_id)
-
-    if created and referrer_id:
-        try:
-            await bot.send_message(
-                referrer_id,
-                f"👤 По вашей ссылке пришёл новый пользователь! Теперь у вас "
-                f"{await get_referral_count(referrer_id)} реферал(ов).",
-            )
-        except Exception:
-            pass
-
-    if await _maybe_ask_for_nft(message, user_id):
-        return
-
-    link = await _generate_ref_link(bot, user_id)
-    await message.answer(
-        f"👋 Привет! Твоя персональная реферальная ссылка:\n\n"
-        f"`{link}`\n\n"
-        f"📊 /stats — количество рефералов\n"
-        f"🔗 /link — получить ссылку повторно",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+async def _generate_group_invite(bot: Bot, user_id: int) -> str:
+    try:
+        # Создаем новую ссылку (name позволяет отличать их в настройках группы)
+        link_obj = await bot.create_chat_invite_link(
+            chat_id=GROUP_ID,
+            name=f"ref_{user_id}",
+            creates_join_request=False
+        )
+        await save_invite_link(link_obj.invite_link, user_id)
+        return link_obj.invite_link
+    except Exception as e:
+        logger.error(f"Ошибка создания ссылки: {e}")
+        return "Не удалось создать ссылку. Убедитесь, что бот админ в группе."
 
 @router.message(CommandStart())
-async def start_plain(message: Message, bot: Bot):
+async def cmd_start(message: Message, bot: Bot):
     user_id = message.from_user.id
     await save_user_if_new(user_id)
-
-    if await _maybe_ask_for_nft(message, user_id):
-        return
-
-    link = await _generate_ref_link(bot, user_id)
-    await message.answer(
-        f"👋 Привет! Твоя персональная реферальная ссылка:\n\n"
+    
+    link = await _generate_group_invite(bot, user_id)
+    
+    text = (
+        f"👋 Привет! Твоя персональная ссылка для вступления в группу:\n\n"
         f"`{link}`\n\n"
         f"📊 /stats — количество рефералов\n"
-        f"🔗 /link — получить ссылку повторно",
-        parse_mode=ParseMode.MARKDOWN,
+        f"🔗 /link — получить ссылку повторно\n\n"
+        f"⚠️ **Важно:** не выходи из группы, иначе реферал не засчитается."
     )
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
 @router.message(Command("link"))
 async def cmd_link(message: Message, bot: Bot):
     user_id = message.from_user.id
     await save_user_if_new(user_id)
-    link = await _generate_ref_link(bot, user_id)
-    await message.answer(f"🔗 Твоя реферальная ссылка:\n\n`{link}`", parse_mode=ParseMode.MARKDOWN)
+    link = await _generate_group_invite(bot, user_id)
+    await message.answer(f"🔗 Твоя ссылка для входа в группу:\n\n`{link}`", parse_mode=ParseMode.MARKDOWN)
 
 @router.message(Command("stats", "myrefs"))
 async def cmd_stats(message: Message):
@@ -203,9 +160,48 @@ async def cmd_stats(message: Message):
         text += f"🎯 До 10 рефералов осталось: {10 - ref_count}"
     else:
         text += "✅ Порог в 10 рефералов достигнут!"
-        
+        nft_username = await get_user_nft_username(user_id)
+        if not nft_username:
+            text += "\n\n⚠️ Укажи юзернейм (без @), куда будут приходить NFT:"
+            await set_user_state(user_id, "waiting_for_username")
+            
     await message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
+# ─── Обработка вступления в группу ───────────────────────────────────────────
+@router.chat_member()
+async def on_chat_member(event: ChatMemberUpdated, bot: Bot):
+    # Реагируем только на нашу группу
+    if event.chat.id != GROUP_ID:
+        return
+        
+    # Пользователь вступил (был left/kicked, стал member/administrator/creator)
+    old_status = event.old_chat_member.status
+    new_status = event.new_chat_member.status
+    
+    if old_status in ("left", "kicked") and new_status in ("member", "administrator", "creator"):
+        new_user_id = event.new_chat_member.user.id
+        
+        # Узнаем, по какой ссылке зашел
+        invite_link = event.invite_link.invite_link if event.invite_link else None
+        if not invite_link:
+            return
+
+        referrer_id = await get_referrer_by_link(invite_link)
+        if referrer_id and referrer_id != new_user_id:
+            # Записываем реферал
+            created = await save_user_if_new(new_user_id, referrer_id)
+            if created:
+                try:
+                    count = await get_referral_count(referrer_id)
+                    await bot.send_message(
+                        referrer_id,
+                        f"👤 По вашей ссылке в группу пришёл новый пользователь!\n"
+                        f"Теперь у вас {count} реферал(ов)."
+                    )
+                except Exception:
+                    pass # Пользователь мог заблокировать бота
+
+# ─── Ввод юзернейма (когда 10 рефов) ─────────────────────────────────────────
 @router.message(F.text, ~F.text.startswith("/"))
 async def handle_nft_username(message: Message, bot: Bot):
     user_id = message.from_user.id
@@ -222,29 +218,15 @@ async def handle_nft_username(message: Message, bot: Bot):
         await message.answer("❌ Некорректный юзернейм. Используй только латиницу, цифры и _ (5–32 символа).")
         return
 
-    ref_count = await get_referral_count(user_id)
-    if ref_count < 10:
-        await set_user_state(user_id, None)
-        await message.answer(f"⚠️ У тебя пока только {ref_count} реферал(ов). Нужно минимум 10.")
-        return
-
-    # Сохраняем в БД
     await set_nft_username_and_state(user_id, username)
     await message.answer(f"✅ Готово! Твой юзернейм `@{username}` сохранен.", parse_mode=ParseMode.MARKDOWN)
     
-    # Отправляем уведомление АДМИНУ
     if ADMIN_ID:
         try:
-            admin_msg = (
-                f"🔔 **Новый получатель NFT!**\n\n"
-                f"Пользователь пригласил 10+ рефералов.\n"
-                f"Его ID: `{user_id}`\n"
-                f"Юзернейм для NFT: `@{username}`"
-            )
+            admin_msg = f"🔔 **Новый получатель NFT!**\n\nID: `{user_id}`\nЮзернейм: `@{username}`"
             await bot.send_message(ADMIN_ID, admin_msg, parse_mode=ParseMode.MARKDOWN)
-            logger.info(f"Admin notified about user {user_id} and username {username}")
-        except Exception as e:
-            logger.error(f"Failed to notify admin: {e}")
+        except Exception:
+            pass
 
 # ─── Polling ─────────────────────────────────────────────────────────────────
 async def run_polling(bot: Bot, dp: Dispatcher, limit_seconds: int):
@@ -254,7 +236,8 @@ async def run_polling(bot: Bot, dp: Dispatcher, limit_seconds: int):
 
     while datetime.now() < end_time:
         try:
-            updates = await bot.get_updates(offset=offset, timeout=30, allowed_updates=["message"])
+            # Важно: добавили "chat_member" в allowed_updates
+            updates = await bot.get_updates(offset=offset, timeout=30, allowed_updates=["message", "chat_member"])
             if not updates:
                 await asyncio.sleep(2)
                 continue
@@ -276,8 +259,6 @@ async def run_polling(bot: Bot, dp: Dispatcher, limit_seconds: int):
 async def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is not set")
-    if not ADMIN_ID:
-        logger.warning("ADMIN_ID is not set. Notifications will not be sent.")
 
     await init_db()
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
