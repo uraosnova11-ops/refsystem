@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import signal
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -143,7 +144,7 @@ async def _generate_group_invite(bot: Bot, user: User) -> str:
         logger.error(f"Ошибка создания ссылки: {e}")
         return "Не удалось создать ссылку. Убедитесь, что бот админ в группе."
 
-# ─── Обработчики команд (СТРОГО ТОЛЬКО В ЛС) ─────────────────────────────────
+# ─── Обработчики команд (ТОЛЬКО В ЛС) ────────────────────────────────────────
 
 @router.message(CommandStart(), F.chat.type == "private")
 async def cmd_start(message: Message, bot: Bot):
@@ -219,7 +220,6 @@ async def on_chat_member(event: ChatMemberUpdated, bot: Bot):
             if created:
                 try:
                     count = await get_referral_count(referrer_id)
-                    # Уведомление летит строго в ЛС пригласившему
                     await bot.send_message(
                         referrer_id,
                         f"👤 По вашей ссылке в группу пришёл новый пользователь!\n"
@@ -228,7 +228,7 @@ async def on_chat_member(event: ChatMemberUpdated, bot: Bot):
                 except Exception:
                     pass 
 
-# ─── Ввод юзернейма (СТРОГО В ЛС) ────────────────────────────────────────────
+# ─── Ввод юзернейма ──────────────────────────────────────────────────────────
 
 @router.message(F.text, ~F.text.startswith("/"), F.chat.type == "private")
 async def handle_nft_username(message: Message, bot: Bot):
@@ -236,7 +236,6 @@ async def handle_nft_username(message: Message, bot: Bot):
     state = await get_user_state(user_id)
     
     if state != "waiting_for_username":
-        # Теперь этот текст полетит только в ЛС, в группу бот промолчит
         await message.answer("Используй /start или /link, чтобы получить ссылку.")
         return
 
@@ -257,17 +256,19 @@ async def handle_nft_username(message: Message, bot: Bot):
         except Exception:
             pass
 
-# ─── Polling ─────────────────────────────────────────────────────────────────
-async def run_polling(bot: Bot, dp: Dispatcher, limit_seconds: int):
+# ─── Polling и Обработка сигналов (SIGTERM) ──────────────────────────────────
+
+async def run_polling(bot: Bot, dp: Dispatcher, limit_seconds: int, stop_event: asyncio.Event):
     offset = load_offset()
     end_time = datetime.now() + timedelta(seconds=limit_seconds)
     logger.info("Polling started. Offset=%s, limit=%ss", offset, limit_seconds)
 
-    while datetime.now() < end_time:
+    # Работаем пока не вышло время ИЛИ пока GitHub не прислал сигнал на убийство (stop_event)
+    while datetime.now() < end_time and not stop_event.is_set():
         try:
             updates = await bot.get_updates(offset=offset, timeout=30, allowed_updates=["message", "chat_member", "callback_query"])
             if not updates:
-                await asyncio.sleep(2)
+                await asyncio.sleep(1)
                 continue
 
             for update in updates:
@@ -283,6 +284,8 @@ async def run_polling(bot: Bot, dp: Dispatcher, limit_seconds: int):
         except Exception:
             logger.exception("Polling error, retrying in 5s")
             await asyncio.sleep(5)
+            
+    logger.info("Polling stopped gracefully.")
 
 async def main():
     if not BOT_TOKEN:
@@ -293,10 +296,25 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
 
+    # Создаем событие для отслеживания остановки
+    stop_event = asyncio.Event()
+    
+    # Функция, которая сработает, когда GitHub Actions убьет процесс
+    def signal_handler():
+        logger.info("Received termination signal! Stopping polling...")
+        stop_event.set()
+
+    # Перехватываем SIGTERM и SIGINT
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, signal_handler)
+
     try:
-        await run_polling(bot, dp, POLLING_LIMIT_SECONDS)
+        await run_polling(bot, dp, POLLING_LIMIT_SECONDS, stop_event)
     finally:
+        # Обязательно закрываем сессию, чтобы Telegram отпустил lock мгновенно
         await bot.session.close()
+        logger.info("Bot session closed. Safe to start new one.")
 
 if __name__ == "__main__":
     asyncio.run(main())
