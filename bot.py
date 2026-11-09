@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import signal
+import html
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -55,16 +56,15 @@ async def init_db():
             );
         """)
         
-        # Безопасно добавляем новые колонки для юзернейма и имени (если их еще нет)
         try:
             await db.execute("ALTER TABLE users ADD COLUMN username TEXT")
         except aiosqlite.OperationalError:
-            pass # Колонка уже существует
+            pass 
             
         try:
             await db.execute("ALTER TABLE users ADD COLUMN first_name TEXT")
         except aiosqlite.OperationalError:
-            pass # Колонка уже существует
+            pass 
             
         await db.commit()
 
@@ -74,17 +74,14 @@ async def get_referral_count(user_id: int) -> int:
         row = await cursor.fetchone()
         return row[0] if row else 0
 
-# ОБНОВЛЕННАЯ ФУНКЦИЯ СОХРАНЕНИЯ (теперь пишет имя и юзернейм)
 async def save_user_if_new(user_id: int, referrer_id: int | None = None, username: str | None = None, first_name: str | None = None) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
         if await cursor.fetchone():
-            # Если юзер уже есть, обновляем его имя/юзернейм (вдруг сменил)
             await db.execute("UPDATE users SET username = ?, first_name = ? WHERE user_id = ?", (username, first_name, user_id))
             await db.commit()
             return False
         
-        # Если новый — записываем
         await db.execute(
             "INSERT INTO users (user_id, referrer_id, username, first_name) VALUES (?, ?, ?, ?)", 
             (user_id, referrer_id, username, first_name)
@@ -246,7 +243,6 @@ async def cmd_users(message: Message):
         return
 
     async with aiosqlite.connect(DB_PATH) as db:
-        # Получаем ID, юзернейм, имя и считаем рефералов
         cursor = await db.execute("""
             SELECT u1.user_id, u1.username, u1.first_name, u1.nft_username, COUNT(u2.user_id) as ref_count
             FROM users u1
@@ -260,29 +256,33 @@ async def cmd_users(message: Message):
         await message.answer("В базе пока нет пользователей.")
         return
 
-    text = "👥 **Список пользователей:**\n\n"
+    text = "👥 <b>Список пользователей:</b>\n\n"
     for row in rows:
         user_id, username, first_name, nft_username, ref_count = row
         
-        # Форматируем имя
+        # Безопасно экранируем имя (чтобы символы < > не ломали HTML)
+        safe_name = html.escape(first_name) if first_name else "Без имени"
+        
+        # Формируем визуальное отображение
         if username:
-            user_str = f"@{username}"
-        elif first_name:
-            user_str = first_name
+            display_name = f"{safe_name} (@{username})"
         else:
-            user_str = "Без имени"
+            display_name = safe_name
             
+        # Делаем имя кликабельным через tg://user?id=
+        user_link = f'<a href="tg://user?id={user_id}">{display_name}</a>'
+        
         nft_str = f"@{nft_username}" if nft_username else "—"
         
-        # Формируем строку
-        text += f"`{user_id}` | {user_str} | NFT: {nft_str} | **{ref_count}** реф.\n"
+        # Формируем строку (используем HTML разметку для ссылки и жирного текста)
+        text += f"{user_link} | NFT: {nft_str} | <b>{ref_count}</b> реф.\n"
         
         if len(text) > 3500:
-            await message.answer(text, parse_mode=ParseMode.MARKDOWN)
-            text = "👥 **Продолжение списка:**\n\n"
+            await message.answer(text, parse_mode=ParseMode.HTML)
+            text = "👥 <b>Продолжение списка:</b>\n\n"
 
-    if text not in ("👥 **Список пользователей:**\n\n", "👥 **Продолжение списка:**\n\n"):
-        await message.answer(text, parse_mode=ParseMode.MARKDOWN)
+    if text not in ("👥 <b>Список пользователей:</b>\n\n", "👥 <b>Продолжение списка:</b>\n\n"):
+        await message.answer(text, parse_mode=ParseMode.HTML)
 
 # ─── Отслеживание вступлений ─────────────────────────────────────────────────
 
@@ -304,7 +304,6 @@ async def on_chat_member(event: ChatMemberUpdated, bot: Bot):
 
         referrer_id = await get_referrer_by_link(invite_link)
         if referrer_id and referrer_id != new_user_id:
-            # Сохраняем нового пользователя, пришедшего по ссылке
             created = await save_user_if_new(
                 new_user_id, 
                 referrer_id=referrer_id, 
