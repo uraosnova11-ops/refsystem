@@ -206,7 +206,6 @@ async def cmd_stats(message: Message, bot: Bot):
     await save_user_if_new(user_id)
     ref_count = await get_referral_count(user_id)
     
-    # ОБНОВЛЕННЫЙ ТЕКСТ СТАТИСТИКИ
     text = f"📊 Ты пригласил: **{ref_count}** реферал(ов).\n"
     
     if ref_count >= 10:
@@ -216,6 +215,47 @@ async def cmd_stats(message: Message, bot: Bot):
             await set_user_state(user_id, "waiting_for_username")
             
     await message.answer(text, parse_mode=ParseMode.MARKDOWN)
+
+# ─── КОМАНДА ДЛЯ АДМИНА: /users ──────────────────────────────────────────────
+
+@router.message(Command("users"), F.chat.type == "private")
+async def cmd_users(message: Message):
+    # Проверяем, что команду пишет именно владелец (ADMIN_ID из секретов)
+    if str(message.from_user.id) != str(ADMIN_ID):
+        await message.answer("❌ У вас нет прав для этой команды.")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Получаем всех юзеров и считаем их рефералов
+        cursor = await db.execute("""
+            SELECT u1.user_id, u1.nft_username, COUNT(u2.user_id) as ref_count
+            FROM users u1
+            LEFT JOIN users u2 ON u1.user_id = u2.referrer_id
+            GROUP BY u1.user_id
+            ORDER BY ref_count DESC, u1.user_id ASC
+        """)
+        rows = await cursor.fetchall()
+
+    if not rows:
+        await message.answer("В базе пока нет пользователей.")
+        return
+
+    text = "👥 **Список пользователей (ID | NFT | Рефералы):**\n\n"
+    for row in rows:
+        user_id, nft_username, ref_count = row
+        nft_str = f"@{nft_username}" if nft_username else "—"
+        
+        # Формируем строку: ID | NFT | Кол-во рефов
+        text += f"`{user_id}` | {nft_str} | **{ref_count}**\n"
+        
+        # Если текст становится слишком длинным (близко к лимиту 4096), отправляем и начинаем новый
+        if len(text) > 3500:
+            await message.answer(text, parse_mode=ParseMode.MARKDOWN)
+            text = "👥 **Продолжение списка:**\n\n"
+
+    # Отправляем остаток, если он есть
+    if text not in ("👥 **Список пользователей (ID | NFT | Рефералы):**\n\n", "👥 **Продолжение списка:**\n\n"):
+        await message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
 # ─── Отслеживание вступлений ─────────────────────────────────────────────────
 
