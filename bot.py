@@ -10,7 +10,7 @@ from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, ChatMemberUpdated, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, User
+from aiogram.types import Message, ChatMemberUpdated, User
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 
 # ─── Конфигурация ────────────────────────────────────────────────────────────
@@ -122,22 +122,19 @@ def load_offset() -> int | None:
 def save_offset(offset: int):
     OFFSET_PATH.write_text(str(offset))
 
-# ─── Роутер и Клавиатура ─────────────────────────────────────────────────────
+# ─── Роутер ──────────────────────────────────────────────────────────────────
 router = Router()
-
-def get_ref_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔗 Создать реф ссылку", callback_data="create_ref_link")]
-    ])
 
 async def _generate_group_invite(bot: Bot, user: User) -> tuple[bool, str]:
     if not GROUP_ID:
         return False, "Ошибка сервера: GROUP_ID не настроен в секретах."
 
+    # 1. Проверяем, есть ли уже ссылка в базе
     existing_link = await get_existing_link(user.id)
     if existing_link:
         return True, existing_link
 
+    # 2. Если нет, генерируем новую
     display_name = user.username or user.first_name or str(user.id)
     safe_name = "".join(c for c in display_name if c.isalnum() or c in " _-")[:32].strip()
     if not safe_name:
@@ -157,11 +154,11 @@ async def _generate_group_invite(bot: Bot, user: User) -> tuple[bool, str]:
 
     except asyncio.TimeoutError:
         logger.error("Timeout creating invite link for user %s", user.id)
-        return False, "⚠️ Telegram не отвечает. Попробуйте нажать кнопку еще раз через минуту."
+        return False, "⚠️ Telegram не отвечает. Попробуйте написать /start еще раз через минуту."
     except TelegramBadRequest as e:
         logger.error(f"BadRequest for user {user.id}: {e}")
         if "not enough rights" in str(e).lower():
-            return False, "❌ Ошибка: у бота нет прав на создание ссылок. Сделайте бота администратором группы с правом 'Приглашать пользователей'."
+            return False, "❌ Ошибка: у бота нет прав. Сделайте бота администратором группы с правом 'Приглашать пользователей'."
         if "chat not found" in str(e).lower():
             return False, "❌ Ошибка: бот не добавлен в группу или указан неверный GROUP_ID."
         return False, f"❌ Ошибка Telegram: {e}"
@@ -177,40 +174,35 @@ async def _generate_group_invite(bot: Bot, user: User) -> tuple[bool, str]:
 
 @router.message(CommandStart(), F.chat.type == "private")
 async def cmd_start(message: Message, bot: Bot):
-    user_id = message.from_user.id
-    await save_user_if_new(user_id)
+    user = message.from_user
+    await save_user_if_new(user.id)
     
-    text = (
-        f"👋 Привет! Я бот для создания реферальных ссылок в нашу группу.\n\n"
-        f"Нажми на кнопку ниже, чтобы получить свою личную ссылку.\n\n"
-        f"📊 /stats — количество приглашенных рефералов"
-    )
-    await message.answer(text, reply_markup=get_ref_keyboard())
+    # Сразу генерируем и отправляем ссылку
+    success, result_text = await _generate_group_invite(bot, user)
+    
+    if success:
+        text = (
+            f"👋 Привет! Твоя персональная ссылка для вступления в группу:\n\n"
+            f"`{result_text}`\n\n"
+            f"📊 /stats — количество приглашенных рефералов\n\n"
+            f"⚠️ **Важно:** не выходи из группы, иначе реферал не засчитается."
+        )
+    else:
+        text = f"👋 Привет!\n{result_text}"
+        
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
 @router.message(Command("link"), F.chat.type == "private")
 async def cmd_link(message: Message, bot: Bot):
-    await save_user_if_new(message.from_user.id)
-    await message.answer("Нажми на кнопку, чтобы создать свою реферальную ссылку:", reply_markup=get_ref_keyboard())
-
-@router.callback_query(F.data == "create_ref_link", F.chat.type == "private")
-async def process_create_link(callback: CallbackQuery, bot: Bot):
-    await callback.answer("Обрабатываю...")
-    
-    user = callback.from_user
+    user = message.from_user
     await save_user_if_new(user.id)
     
     success, result_text = await _generate_group_invite(bot, user)
     
     if success:
-        text = (
-            f"✅ Твоя персональная ссылка для вступления в группу:\n\n"
-            f"`{result_text}`\n\n"
-            f"⚠️ **Важно:** не выходи из группы, иначе реферал не засчитается."
-        )
+        await message.answer(f"🔗 Твоя ссылка для входа в группу:\n\n`{result_text}`", parse_mode=ParseMode.MARKDOWN)
     else:
-        text = result_text
-        
-    await callback.message.answer(text, parse_mode=ParseMode.MARKDOWN)
+        await message.answer(result_text)
 
 @router.message(Command("stats", "myrefs"), F.chat.type == "private")
 async def cmd_stats(message: Message, bot: Bot):
@@ -290,7 +282,7 @@ async def handle_nft_username(message: Message, bot: Bot):
         except Exception:
             pass
 
-# ─── Polling и Обработка сигналов (SIGTERM) ──────────────────────────────────
+# ─── Polling и Обработка сигналов ────────────────────────────────────────────
 
 async def run_polling(bot: Bot, dp: Dispatcher, limit_seconds: int, stop_event: asyncio.Event):
     offset = load_offset()
@@ -299,7 +291,8 @@ async def run_polling(bot: Bot, dp: Dispatcher, limit_seconds: int, stop_event: 
 
     while datetime.now() < end_time and not stop_event.is_set():
         try:
-            updates = await bot.get_updates(offset=offset, timeout=30, allowed_updates=["message", "chat_member", "callback_query"])
+            # Убрал callback_query, так как кнопок больше нет
+            updates = await bot.get_updates(offset=offset, timeout=30, allowed_updates=["message", "chat_member"])
             if not updates:
                 await asyncio.sleep(1)
                 continue
@@ -345,6 +338,5 @@ async def main():
         await bot.session.close()
         logger.info("Bot session closed. Safe to start new one.")
 
-# ВОТ ЗДЕСЬ БЫЛА ОШИБКА, ТЕПЕРЬ ИСПОЛЬЗУЕТСЯ asyncio.run()
 if __name__ == "__main__":
     asyncio.run(main())
