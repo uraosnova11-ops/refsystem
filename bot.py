@@ -11,6 +11,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, ChatMemberUpdated, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, User
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 
 # ─── Конфигурация ────────────────────────────────────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -81,6 +82,13 @@ async def get_referrer_by_link(link: str) -> int | None:
         row = await cursor.fetchone()
         return row[0] if row else None
 
+# НОВАЯ ФУНКЦИЯ: Получаем ссылку пользователя, если она уже есть в базе
+async def get_existing_link(referrer_id: int) -> str | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT invite_link FROM invite_links WHERE referrer_id = ? LIMIT 1", (referrer_id,))
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
 async def get_user_nft_username(user_id: int) -> str | None:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("SELECT nft_username FROM users WHERE user_id = ?", (user_id,))
@@ -123,26 +131,52 @@ def get_ref_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🔗 Создать реф ссылку", callback_data="create_ref_link")]
     ])
 
-async def _generate_group_invite(bot: Bot, user: User) -> str:
+# ОБНОВЛЕННАЯ ФУНКЦИЯ С ТАЙМ-АУТОМ И ОБРАБОТКОЙ ОШИБОК
+async def _generate_group_invite(bot: Bot, user: User) -> tuple[bool, str]:
     if not GROUP_ID:
-        return "Ошибка: GROUP_ID не настроен в секретах."
-    
+        return False, "Ошибка сервера: GROUP_ID не настроен в секретах."
+
+    # 1. Проверяем, есть ли уже ссылка в базе
+    existing_link = await get_existing_link(user.id)
+    if existing_link:
+        return True, existing_link
+
+    # 2. Если нет, генерируем новую
     display_name = user.username or user.first_name or str(user.id)
     safe_name = "".join(c for c in display_name if c.isalnum() or c in " _-")[:32].strip()
     if not safe_name:
         safe_name = f"user_{user.id}"
 
     try:
-        link_obj = await bot.create_chat_invite_link(
-            chat_id=GROUP_ID,
-            name=safe_name,
-            creates_join_request=False
+        # Ждем ответ от Telegram не более 10 секунд, чтобы бот не завис навсегда
+        link_obj = await asyncio.wait_for(
+            bot.create_chat_invite_link(
+                chat_id=GROUP_ID,
+                name=safe_name,
+                creates_join_request=False
+            ),
+            timeout=10.0
         )
         await save_invite_link(link_obj.invite_link, user.id)
-        return link_obj.invite_link
+        return True, link_obj.invite_link
+
+    except asyncio.TimeoutError:
+        logger.error("Timeout creating invite link for user %s", user.id)
+        return False, "⚠️ Telegram не отвечает. Попробуйте нажать кнопку еще раз через минуту."
+    except TelegramBadRequest as e:
+        logger.error(f"BadRequest for user {user.id}: {e}")
+        if "not enough rights" in str(e).lower():
+            return False, "❌ Ошибка: у бота нет прав на создание ссылок. Сделайте бота администратором группы с правом 'Приглашать пользователей'."
+        if "chat not found" in str(e).lower():
+            return False, "❌ Ошибка: бот не добавлен в группу или указан неверный GROUP_ID."
+        return False, f"❌ Ошибка Telegram: {e}"
+    except TelegramRetryAfter as e:
+        logger.error(f"Flood control for user {user.id}: {e}")
+        return False, f"⏳ Слишком много запросов. Подождите {e.retry_after} секунд."
     except Exception as e:
-        logger.error(f"Ошибка создания ссылки: {e}")
-        return "Не удалось создать ссылку. Убедитесь, что бот админ в группе."
+        logger.exception("Unexpected error creating invite link")
+        return False, "❌ Неизвестная ошибка при создании ссылки. Проверьте логи."
+
 
 # ─── Обработчики команд (ТОЛЬКО В ЛС) ────────────────────────────────────────
 
@@ -165,17 +199,24 @@ async def cmd_link(message: Message, bot: Bot):
 
 @router.callback_query(F.data == "create_ref_link", F.chat.type == "private")
 async def process_create_link(callback: CallbackQuery, bot: Bot):
-    await callback.answer("Создаю ссылку...")
+    # Сразу убираем "часики" с кнопки
+    await callback.answer("Обрабатываю...")
+    
     user = callback.from_user
     await save_user_if_new(user.id)
     
-    link = await _generate_group_invite(bot, user)
+    # Генерируем ссылку (с проверкой на существование и тайм-аутом)
+    success, result_text = await _generate_group_invite(bot, user)
     
-    text = (
-        f"✅ Твоя персональная ссылка для вступления в группу:\n\n"
-        f"`{link}`\n\n"
-        f"⚠️ **Важно:** не выходи из группы, иначе реферал не засчитается."
-    )
+    if success:
+        text = (
+            f"✅ Твоя персональная ссылка для вступления в группу:\n\n"
+            f"`{result_text}`\n\n"
+            f"⚠️ **Важно:** не выходи из группы, иначе реферал не засчитается."
+        )
+    else:
+        text = result_text
+        
     await callback.message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
 @router.message(Command("stats", "myrefs"), F.chat.type == "private")
@@ -263,7 +304,6 @@ async def run_polling(bot: Bot, dp: Dispatcher, limit_seconds: int, stop_event: 
     end_time = datetime.now() + timedelta(seconds=limit_seconds)
     logger.info("Polling started. Offset=%s, limit=%ss", offset, limit_seconds)
 
-    # Работаем пока не вышло время ИЛИ пока GitHub не прислал сигнал на убийство (stop_event)
     while datetime.now() < end_time and not stop_event.is_set():
         try:
             updates = await bot.get_updates(offset=offset, timeout=30, allowed_updates=["message", "chat_member", "callback_query"])
@@ -296,15 +336,12 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
 
-    # Создаем событие для отслеживания остановки
     stop_event = asyncio.Event()
     
-    # Функция, которая сработает, когда GitHub Actions убьет процесс
     def signal_handler():
         logger.info("Received termination signal! Stopping polling...")
         stop_event.set()
 
-    # Перехватываем SIGTERM и SIGINT
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, signal_handler)
@@ -312,9 +349,8 @@ async def main():
     try:
         await run_polling(bot, dp, POLLING_LIMIT_SECONDS, stop_event)
     finally:
-        # Обязательно закрываем сессию, чтобы Telegram отпустил lock мгновенно
         await bot.session.close()
         logger.info("Bot session closed. Safe to start new one.")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    await main()
