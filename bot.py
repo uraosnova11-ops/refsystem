@@ -117,16 +117,26 @@ def save_offset(offset: int):
 # ─── Роутер ──────────────────────────────────────────────────────────────────
 router = Router()
 
-async def _generate_group_invite(bot: Bot, user_id: int) -> str:
+async def _generate_group_invite(bot: Bot, user: User) -> str:
     if not GROUP_ID:
         return "Ошибка: GROUP_ID не настроен в секретах."
+    
+    # Получаем имя для ссылки: username, если есть, иначе имя, иначе ID
+    display_name = user.username or user.first_name or str(user.id)
+    
+    # Очищаем имя от лишних символов (Telegram не любит некоторые спецсимволы в названиях ссылок)
+    # Оставляем только буквы, цифры, пробелы, дефисы и подчеркивания. Максимум 32 символа.
+    safe_name = "".join(c for c in display_name if c.isalnum() or c in " _-")[:32].strip()
+    if not safe_name:
+        safe_name = f"user_{user.id}"
+
     try:
         link_obj = await bot.create_chat_invite_link(
             chat_id=GROUP_ID,
-            name=f"ref_{user_id}",
+            name=safe_name,  # <- Теперь здесь имя пользователя!
             creates_join_request=False
         )
-        await save_invite_link(link_obj.invite_link, user_id)
+        await save_invite_link(link_obj.invite_link, user.id)
         return link_obj.invite_link
     except Exception as e:
         logger.error(f"Ошибка создания ссылки: {e}")
@@ -134,10 +144,10 @@ async def _generate_group_invite(bot: Bot, user_id: int) -> str:
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, bot: Bot):
-    user_id = message.from_user.id
-    await save_user_if_new(user_id)
+    user = message.from_user
+    await save_user_if_new(user.id)
     
-    link = await _generate_group_invite(bot, user_id)
+    link = await _generate_group_invite(bot, user)
     
     text = (
         f"👋 Привет! Твоя персональная ссылка для вступления в группу:\n\n"
@@ -150,9 +160,9 @@ async def cmd_start(message: Message, bot: Bot):
 
 @router.message(Command("link"))
 async def cmd_link(message: Message, bot: Bot):
-    user_id = message.from_user.id
-    await save_user_if_new(user_id)
-    link = await _generate_group_invite(bot, user_id)
+    user = message.from_user
+    await save_user_if_new(user.id)
+    link = await _generate_group_invite(bot, user)
     await message.answer(f"🔗 Твоя ссылка для входа в группу:\n\n`{link}`", parse_mode=ParseMode.MARKDOWN)
 
 @router.message(Command("stats", "myrefs"))
@@ -237,7 +247,6 @@ async def run_polling(bot: Bot, dp: Dispatcher, limit_seconds: int):
 
     while datetime.now() < end_time:
         try:
-            # Обязательно добавлен "chat_member" для отслеживания вступлений
             updates = await bot.get_updates(offset=offset, timeout=30, allowed_updates=["message", "chat_member"])
             if not updates:
                 await asyncio.sleep(2)
