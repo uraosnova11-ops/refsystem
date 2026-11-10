@@ -67,9 +67,14 @@ async def init_db():
         except aiosqlite.OperationalError:
             pass 
 
-        # НОВАЯ КОЛОНКА: сохраняем ссылку прямо в юзера
         try:
             await db.execute("ALTER TABLE users ADD COLUMN invite_link TEXT")
+        except aiosqlite.OperationalError:
+            pass 
+
+        # НОВАЯ КОЛОНКА: находится ли пользователь сейчас в группе (1 = да, 0 = нет)
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN in_group INTEGER DEFAULT 1")
         except aiosqlite.OperationalError:
             pass 
             
@@ -77,7 +82,8 @@ async def init_db():
 
 async def get_referral_count(user_id: int) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT COUNT(*) FROM users WHERE referrer_id = ?", (user_id,))
+        # Считаем только тех, кто сейчас находится в группе (in_group = 1)
+        cursor = await db.execute("SELECT COUNT(*) FROM users WHERE referrer_id = ? AND in_group = 1", (user_id,))
         row = await cursor.fetchone()
         return row[0] if row else 0
 
@@ -90,7 +96,7 @@ async def save_user_if_new(user_id: int, referrer_id: int | None = None, usernam
             return False
         
         await db.execute(
-            "INSERT INTO users (user_id, referrer_id, username, first_name) VALUES (?, ?, ?, ?)", 
+            "INSERT INTO users (user_id, referrer_id, username, first_name, in_group) VALUES (?, ?, ?, ?, 1)", 
             (user_id, referrer_id, username, first_name)
         )
         await db.commit()
@@ -98,13 +104,11 @@ async def save_user_if_new(user_id: int, referrer_id: int | None = None, usernam
 
 async def get_referrer_by_link(link: str) -> int | None:
     async with aiosqlite.connect(DB_PATH) as db:
-        # Ищем в новой колонке users
         cursor = await db.execute("SELECT user_id FROM users WHERE invite_link = ?", (link,))
         row = await cursor.fetchone()
         if row:
             return row[0]
         
-        # Фоллбэк на старую таблицу invite_links
         cursor = await db.execute("SELECT referrer_id FROM invite_links WHERE invite_link = ?", (link,))
         row = await cursor.fetchone()
         return row[0] if row else None
@@ -150,14 +154,12 @@ async def _generate_group_invite(bot: Bot, user: User) -> tuple[bool, str]:
     if not GROUP_ID:
         return False, "Ошибка сервера: GROUP_ID не настроен в секретах."
 
-    # 1. Ищем ссылку в профиле юзера
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("SELECT invite_link FROM users WHERE user_id = ?", (user.id,))
         row = await cursor.fetchone()
         if row and row[0]:
-            return True, row[0] # Если ссылка есть, отдаем её НАВСЕГДА
+            return True, row[0]
 
-    # 2. Если нет, генерируем новую
     display_name = user.username or user.first_name or str(user.id)
     safe_name = "".join(c for c in display_name if c.isalnum() or c in " _-")[:32].strip()
     if not safe_name:
@@ -174,10 +176,8 @@ async def _generate_group_invite(bot: Bot, user: User) -> tuple[bool, str]:
         )
         new_link = link_obj.invite_link
 
-        # 3. Жестко сохраняем ссылку в профиль, чтобы больше никогда её не менять
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("UPDATE users SET invite_link = ? WHERE user_id = ?", (new_link, user.id))
-            # Дублируем в старую таблицу для обратной совместимости
             await db.execute("INSERT OR REPLACE INTO invite_links (invite_link, referrer_id) VALUES (?, ?)", (new_link, user.id))
             await db.commit()
 
@@ -258,10 +258,11 @@ async def cmd_users(message: Message):
         return
 
     async with aiosqlite.connect(DB_PATH) as db:
+        # Считаем только тех, кто в группе
         cursor = await db.execute("""
             SELECT u1.user_id, u1.username, u1.first_name, u1.nft_username, COUNT(u2.user_id) as ref_count
             FROM users u1
-            LEFT JOIN users u2 ON u1.user_id = u2.referrer_id
+            LEFT JOIN users u2 ON u1.user_id = u2.referrer_id AND u2.in_group = 1
             GROUP BY u1.user_id
             ORDER BY ref_count DESC, u1.user_id ASC
         """)
@@ -297,7 +298,7 @@ async def cmd_users(message: Message):
     if text not in ("👥 <b>Список пользователей:</b>\n\n", "👥 <b>Продолжение списка:</b>\n\n"):
         await message.answer(text, parse_mode=ParseMode.HTML)
 
-# ─── Отслеживание вступлений ─────────────────────────────────────────────────
+# ─── Отслеживание ВХОДОВ И ВЫХОДОВ ───────────────────────────────────────────
 
 @router.chat_member()
 async def on_chat_member(event: ChatMemberUpdated, bot: Bot):
@@ -307,32 +308,77 @@ async def on_chat_member(event: ChatMemberUpdated, bot: Bot):
     old_status = event.old_chat_member.status
     new_status = event.new_chat_member.status
     
+    # --- СОБЫТИЕ: ПОЛЬЗОВАТЕЛЬ ВОШЕЛ ---
     if old_status in ("left", "kicked") and new_status in ("member", "administrator", "creator"):
         new_user = event.new_chat_member.user
         new_user_id = new_user.id
         
         invite_link = event.invite_link.invite_link if event.invite_link else None
-        if not invite_link:
-            return
+        referrer_id = await get_referrer_by_link(invite_link) if invite_link else None
+        
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Проверяем, есть ли он уже в базе и был ли он в группе
+            cursor = await db.execute("SELECT referrer_id, in_group FROM users WHERE user_id = ?", (new_user_id,))
+            row = await cursor.fetchone()
+            
+            if row:
+                old_ref, was_in_group = row
+                # Если он вернулся, сохраняем старого реферера, если не пришел по новой ссылке
+                final_ref = referrer_id if referrer_id else old_ref
+                
+                await db.execute(
+                    "UPDATE users SET referrer_id = ?, in_group = 1, username = ?, first_name = ? WHERE user_id = ?", 
+                    (final_ref, new_user.username, new_user.first_name, new_user_id)
+                )
+                is_new_referral = not was_in_group # Новый реферал, если его раньше не было в группе
+            else:
+                # Абсолютно новый пользователь
+                await db.execute(
+                    "INSERT INTO users (user_id, referrer_id, in_group, username, first_name) VALUES (?, ?, 1, ?, ?)",
+                    (new_user_id, referrer_id, new_user.username, new_user.first_name)
+                )
+                is_new_referral = True
+                
+            await db.commit()
+            
+        # Уведомляем пригласившего, если это реальный новый вход
+        if referrer_id and referrer_id != new_user_id and is_new_referral:
+            try:
+                count = await get_referral_count(referrer_id)
+                await bot.send_message(
+                    referrer_id,
+                    f"👤 По вашей ссылке в группу пришёл новый пользователь!\n"
+                    f"Теперь у вас {count} реферал(ов)."
+                )
+            except Exception:
+                pass
 
-        referrer_id = await get_referrer_by_link(invite_link)
-        if referrer_id and referrer_id != new_user_id:
-            created = await save_user_if_new(
-                new_user_id, 
-                referrer_id=referrer_id, 
-                username=new_user.username, 
-                first_name=new_user.first_name
-            )
-            if created:
-                try:
-                    count = await get_referral_count(referrer_id)
-                    await bot.send_message(
-                        referrer_id,
-                        f"👤 По вашей ссылке в группу пришёл новый пользователь!\n"
-                        f"Теперь у вас {count} реферал(ов)."
-                    )
-                except Exception:
-                    pass 
+    # --- СОБЫТИЕ: ПОЛЬЗОВАТЕЛЬ ВЫШЕЛ ---
+    elif old_status in ("member", "administrator", "creator") and new_status in ("left", "kicked"):
+        left_user = event.old_chat_member.user
+        left_user_id = left_user.id
+        
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Ставим статус "не в группе"
+            await db.execute("UPDATE users SET in_group = 0 WHERE user_id = ?", (left_user_id,))
+            await db.commit()
+            
+            # Узнаем, кто его пригласил
+            cursor = await db.execute("SELECT referrer_id FROM users WHERE user_id = ?", (left_user_id,))
+            row = await cursor.fetchone()
+            referrer_id = row[0] if row else None
+            
+        # Уведомляем пригласившего, что реферал ушел (счетчик уменьшился)
+        if referrer_id:
+            try:
+                count = await get_referral_count(referrer_id)
+                await bot.send_message(
+                    referrer_id,
+                    f"🚶 Один из ваших рефералов покинул группу.\n"
+                    f"Теперь у вас {count} реферал(ов)."
+                )
+            except Exception:
+                pass
 
 # ─── Ввод юзернейма ──────────────────────────────────────────────────────────
 
